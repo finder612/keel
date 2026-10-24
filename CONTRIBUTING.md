@@ -41,6 +41,14 @@ Add a test for whatever you change. Tests go in `tests/tests.cpp`, and they
 shouldn't depend on real wall-clock time unless there's truly no other way
 (timeout is the one exception right now).
 
+`single_include/keel/keel.hpp` is generated, so never edit it by hand. After
+changing anything in `include/keel/`, run `python tools/amalgamate.py` and
+commit the regenerated file along with your change; CI checks that they match.
+
+If a change is meant to make something faster, show it: run `bench/` before
+and after (Release build, same machine) and put both numbers in the pull
+request.
+
 Run `clang-format` before you commit. The repo's `.clang-format` has the
 settings.
 

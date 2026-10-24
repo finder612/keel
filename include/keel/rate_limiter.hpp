@@ -47,8 +47,8 @@ public:
         : rate_(std::max(rate_per_second, 0.0)),
           capacity_(std::max(burst, 0.0)),
           tokens_(capacity_),
-          now_(clock ? std::move(clock) : ClockFn{&default_now}),
-          last_(now_()) {}
+          clock_(std::move(clock)),
+          last_(clock_.now()) {}
 
     RateLimiter(const RateLimiter&) = delete;
     RateLimiter& operator=(const RateLimiter&) = delete;
@@ -96,7 +96,7 @@ private:
 
     // Caller must hold the lock.
     void refill() {
-        const TimePoint now = now_();
+        const TimePoint now = clock_.now();
         const double elapsed = std::chrono::duration<double>(now - last_).count();
         if (elapsed > 0.0) {
             tokens_ = std::min(capacity_, tokens_ + elapsed * rate_);
@@ -115,7 +115,7 @@ private:
     double rate_;
     double capacity_;
     double tokens_;
-    ClockFn now_;
+    detail::Clock clock_;
     TimePoint last_;
     std::mutex mutex_;
 };

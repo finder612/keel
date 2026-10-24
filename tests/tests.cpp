@@ -1056,3 +1056,379 @@ TEST("SingleFlight: forget lets the next caller start a fresh call") {
     CHECK(second == 2);
     CHECK(flight.in_flight() == 0);
 }
+
+// ---------------------------------------------------------------------------
+// Bulkhead
+// ---------------------------------------------------------------------------
+
+using keel::Bulkhead;
+using keel::BulkheadConfig;
+
+TEST("Bulkhead: admits up to max_concurrent, then rejects") {
+    Bulkhead bulkhead{BulkheadConfig{}.with_max_concurrent(2)};
+    auto a = bulkhead.try_acquire();
+    auto b = bulkhead.try_acquire();
+    CHECK(a.has_value() && b.has_value());
+    CHECK(!bulkhead.try_acquire().has_value());
+    CHECK(bulkhead.in_flight() == 2);
+    CHECK(bulkhead.available() == 0);
+
+    a.reset();  // frees a slot
+    CHECK(bulkhead.available() == 1);
+    CHECK(bulkhead.try_acquire().has_value());
+}
+
+TEST("Bulkhead: execute throws bulkhead_full_error when full") {
+    Bulkhead bulkhead{BulkheadConfig{}.with_max_concurrent(1)};
+    auto held = bulkhead.try_acquire();
+    CHECK(throws<keel::bulkhead_full_error>([&] { bulkhead.execute([] { return 1; }); }));
+    CHECK(throws<keel::error>([&] { bulkhead.execute([] { return 1; }); }));
+}
+
+TEST("Bulkhead: execute frees the slot even when the call throws") {
+    Bulkhead bulkhead{BulkheadConfig{}.with_max_concurrent(1)};
+    CHECK(throws<std::runtime_error>(
+        [&] { bulkhead.execute([]() -> int { throw std::runtime_error("x"); }); }));
+    CHECK(bulkhead.in_flight() == 0);
+    CHECK(bulkhead.execute([] { return 5; }) == 5);
+}
+
+TEST("Bulkhead: a queued caller gets the next free slot") {
+    Bulkhead bulkhead{BulkheadConfig{}.with_max_concurrent(1).with_max_queue(1)};
+    auto held = bulkhead.try_acquire();
+
+    bool got = false;
+    std::thread waiter([&] {
+        auto permit = bulkhead.acquire_for(Duration{5000});
+        got = permit.has_value();
+    });
+    const bool queued = wait_until([&] { return bulkhead.waiting() == 1; });
+    held.reset();
+    waiter.join();
+
+    CHECK(queued);
+    CHECK(got);
+    CHECK(bulkhead.in_flight() == 0);
+    CHECK(bulkhead.waiting() == 0);
+}
+
+TEST("Bulkhead: no waiting when the queue is full or zero-sized") {
+    Bulkhead no_queue{BulkheadConfig{}.with_max_concurrent(1)};
+    auto held = no_queue.try_acquire();
+    CHECK(!no_queue.acquire_for(Duration{5000}).has_value());  // returns at once
+    CHECK(no_queue.waiting() == 0);
+}
+
+TEST("Bulkhead: a waiting caller gives up after max_wait") {
+    Bulkhead bulkhead{BulkheadConfig{}.with_max_concurrent(1).with_max_queue(1)};
+    auto held = bulkhead.try_acquire();
+    CHECK(!bulkhead.acquire_for(Duration{20}).has_value());
+    CHECK(bulkhead.waiting() == 0);
+}
+
+TEST("Bulkhead: moving a permit transfers the slot") {
+    Bulkhead bulkhead{BulkheadConfig{}.with_max_concurrent(2)};
+    auto a = bulkhead.try_acquire();
+    auto b = bulkhead.try_acquire();
+    *a = std::move(*b);  // a's old slot is released, b's slot now lives in a
+    CHECK(bulkhead.in_flight() == 1);
+    b.reset();  // the moved-from permit holds nothing
+    CHECK(bulkhead.in_flight() == 1);
+    a.reset();
+    CHECK(bulkhead.in_flight() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// AdaptiveLimiter
+// ---------------------------------------------------------------------------
+
+using keel::AdaptiveLimiter;
+using keel::AdaptiveLimiterConfig;
+
+namespace {
+
+enum class Report { Success, Dropped };
+
+// Admits `in_flight` calls (or as many as the limit allows when 0), lets `rtt`
+// pass on the fake clock, then reports `report` for the last one. The others
+// are released without a sample.
+void sample(AdaptiveLimiter& limiter, FakeClock& clock, std::size_t in_flight, Duration rtt,
+            Report report = Report::Success) {
+    std::vector<AdaptiveLimiter::Permit> permits;
+    for (std::size_t i = 0; in_flight == 0 || i < in_flight; ++i) {
+        auto p = limiter.try_acquire();
+        if (!p) break;
+        permits.push_back(std::move(*p));
+    }
+    clock.advance(rtt);
+    if (permits.empty()) return;
+    if (report == Report::Success)
+        permits.back().success();
+    else
+        permits.back().dropped();
+}
+
+}  // namespace
+
+TEST("AdaptiveLimiter: rejects calls over the current limit") {
+    FakeClock clock;
+    AdaptiveLimiter limiter{keel::AimdLimit{}, AdaptiveLimiterConfig{}.with_initial_limit(2),
+                            std::ref(clock)};
+    auto a = limiter.try_acquire();
+    auto b = limiter.try_acquire();
+    CHECK(a.has_value() && b.has_value());
+    CHECK(!limiter.try_acquire().has_value());
+    CHECK(throws<keel::limit_exceeded_error>([&] { limiter.execute([] { return 1; }); }));
+}
+
+TEST("AimdLimit: grows by one when the limit is actually used") {
+    FakeClock clock;
+    AdaptiveLimiter limiter{keel::AimdLimit{}, AdaptiveLimiterConfig{}.with_initial_limit(4),
+                            std::ref(clock)};
+    sample(limiter, clock, 4, Duration{10});
+    CHECK(limiter.limit() == 5.0);
+}
+
+TEST("AimdLimit: does not grow while the limit is mostly unused") {
+    FakeClock clock;
+    AdaptiveLimiter limiter{keel::AimdLimit{}, AdaptiveLimiterConfig{}.with_initial_limit(10),
+                            std::ref(clock)};
+    sample(limiter, clock, 1, Duration{10});
+    CHECK(limiter.limit() == 10.0);
+}
+
+TEST("AimdLimit: backs off on a drop, and treats too-slow calls as drops") {
+    FakeClock clock;
+    AdaptiveLimiter limiter{keel::AimdLimit{}.with_backoff_ratio(0.5).with_timeout(Duration{100}),
+                            AdaptiveLimiterConfig{}.with_initial_limit(16), std::ref(clock)};
+    sample(limiter, clock, 1, Duration{10}, Report::Dropped);
+    CHECK(limiter.limit() == 8.0);
+    sample(limiter, clock, 8, Duration{200});  // succeeded, but slower than 100ms
+    CHECK(limiter.limit() == 4.0);
+}
+
+TEST("AdaptiveLimiter: keeps the limit within [min_limit, max_limit]") {
+    FakeClock clock;
+    AdaptiveLimiter capped{keel::AimdLimit{},
+                           AdaptiveLimiterConfig{}.with_initial_limit(3).with_max_limit(4),
+                           std::ref(clock)};
+    sample(capped, clock, 3, Duration{10});
+    sample(capped, clock, 4, Duration{10});
+    CHECK(capped.limit() == 4.0);
+
+    AdaptiveLimiter floored{keel::AimdLimit{}.with_backoff_ratio(0.1),
+                            AdaptiveLimiterConfig{}.with_initial_limit(5).with_min_limit(2),
+                            std::ref(clock)};
+    sample(floored, clock, 1, Duration{10}, Report::Dropped);
+    CHECK(floored.limit() == 2.0);
+}
+
+TEST("VegasLimit: grows with no queueing, shrinks when latency climbs") {
+    FakeClock clock;
+    AdaptiveLimiter limiter{keel::VegasLimit{}, AdaptiveLimiterConfig{}.with_initial_limit(10),
+                            std::ref(clock)};
+    sample(limiter, clock, 0, Duration{10});  // sets the no-load latency
+    CHECK(limiter.limit() == 11.0);
+
+    const double before = limiter.limit();
+    sample(limiter, clock, 0, Duration{100});  // 10x slower: lots of queueing
+    CHECK(limiter.limit() < before);
+}
+
+TEST("GradientLimit: climbs while latency is steady, drops when it spikes") {
+    FakeClock clock;
+    AdaptiveLimiter limiter{keel::GradientLimit{}, AdaptiveLimiterConfig{}.with_initial_limit(20),
+                            std::ref(clock)};
+    for (int i = 0; i < 20; ++i) sample(limiter, clock, 0, Duration{10});
+    const double peak = limiter.limit();
+    CHECK(peak > 20.0);
+
+    for (int i = 0; i < 20; ++i) sample(limiter, clock, 0, Duration{100});
+    CHECK(limiter.limit() < peak);
+}
+
+TEST("AdaptiveLimiter: accepts your own LimitAlgorithm") {
+    struct PlusFive : keel::LimitAlgorithm {
+        double update(double limit, const keel::LimitSample&) override { return limit + 5.0; }
+    };
+    FakeClock clock;
+    AdaptiveLimiter limiter{PlusFive{}, AdaptiveLimiterConfig{}.with_initial_limit(10),
+                            std::ref(clock)};
+    sample(limiter, clock, 1, Duration{10});
+    CHECK(limiter.limit() == 15.0);
+
+    // Also when the algorithm is picked at runtime.
+    std::unique_ptr<keel::LimitAlgorithm> algo = std::make_unique<PlusFive>();
+    AdaptiveLimiter dynamic{std::move(algo), AdaptiveLimiterConfig{}.with_initial_limit(1),
+                            std::ref(clock)};
+    sample(dynamic, clock, 1, Duration{10});
+    CHECK(dynamic.limit() == 6.0);
+}
+
+TEST("AdaptiveLimiter: drop_if keeps ordinary errors from lowering the limit") {
+    FakeClock clock;
+    AdaptiveLimiter limiter{keel::AimdLimit{}.with_backoff_ratio(0.5),
+                            AdaptiveLimiterConfig{}.with_initial_limit(10).with_drop_if(
+                                [](const std::exception& e) {
+                                    return dynamic_cast<const std::logic_error*>(&e) == nullptr;
+                                }),
+                            std::ref(clock)};
+
+    CHECK(throws<std::logic_error>(
+        [&] { limiter.execute([]() -> int { throw std::logic_error("bad input"); }); }));
+    CHECK(limiter.limit() == 10.0);
+
+    CHECK(throws<std::runtime_error>(
+        [&] { limiter.execute([]() -> int { throw std::runtime_error("overloaded"); }); }));
+    CHECK(limiter.limit() == 5.0);
+    CHECK(limiter.in_flight() == 0);
+}
+
+TEST("AdaptiveLimiter: on_limit_change and dropped permits") {
+    FakeClock clock;
+    std::vector<std::pair<double, double>> changes;
+    AdaptiveLimiter limiter{keel::AimdLimit{}.with_backoff_ratio(0.5),
+                            AdaptiveLimiterConfig{}.with_initial_limit(10).with_on_limit_change(
+                                [&](double from, double to) { changes.emplace_back(from, to); }),
+                            std::ref(clock)};
+
+    { auto unused = limiter.try_acquire(); }  // released without a report
+    CHECK(limiter.in_flight() == 0);
+    CHECK(limiter.limit() == 10.0);
+    CHECK(changes.empty());
+
+    sample(limiter, clock, 1, Duration{10}, Report::Dropped);
+    CHECK(changes.size() == 1);
+    CHECK(changes.size() == 1 && changes[0] == std::make_pair(10.0, 5.0));
+}
+
+// ---------------------------------------------------------------------------
+// CircuitBreaker: count and time windows, slow calls
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void succeed(CircuitBreaker& cb) { cb.execute([] { return 0; }); }
+
+void fail(CircuitBreaker& cb) {
+    try {
+        cb.execute([]() -> int { throw std::runtime_error("x"); });
+    } catch (const std::runtime_error&) {
+    }
+}
+
+}  // namespace
+
+TEST("CircuitBreaker: count window trips on the failure rate") {
+    FakeClock clock;
+    CircuitBreaker cb{CircuitConfig{}
+                          .with_count_window(10)
+                          .with_minimum_calls(10)
+                          .with_failure_rate_threshold(0.5),
+                      std::ref(clock)};
+
+    for (int i = 0; i < 6; ++i) succeed(cb);
+    for (int i = 0; i < 4; ++i) fail(cb);
+    CHECK(cb.state() == CircuitState::Closed);  // 4 of 10 = 40%
+    CHECK(cb.metrics().failure_rate == 0.4);
+
+    fail(cb);  // the oldest success drops out: 5 of 10 = 50%
+    CHECK(cb.state() == CircuitState::Open);
+}
+
+TEST("CircuitBreaker: a window waits for minimum_calls before judging") {
+    FakeClock clock;
+    CircuitBreaker cb{CircuitConfig{}.with_count_window(100).with_minimum_calls(5),
+                      std::ref(clock)};
+    for (int i = 0; i < 4; ++i) fail(cb);
+    CHECK(cb.state() == CircuitState::Closed);  // 100% failures, but only 4 calls
+    fail(cb);
+    CHECK(cb.state() == CircuitState::Open);
+}
+
+TEST("CircuitBreaker: time window forgets old calls") {
+    FakeClock clock;
+    CircuitBreaker cb{CircuitConfig{}
+                          .with_time_window(Duration{10000})
+                          .with_minimum_calls(4)
+                          .with_failure_rate_threshold(0.5),
+                      std::ref(clock)};
+
+    fail(cb);
+    fail(cb);
+    clock.advance(Duration{11000});  // those two are now outside the window
+    succeed(cb);
+    succeed(cb);
+    succeed(cb);
+    fail(cb);
+    CHECK(cb.metrics().calls == 4);
+    CHECK(cb.state() == CircuitState::Closed);  // 1 of 4
+
+    fail(cb);
+    fail(cb);  // 3 of 6
+    CHECK(cb.state() == CircuitState::Open);
+}
+
+TEST("CircuitBreaker: trips when too many calls are slow") {
+    FakeClock clock;
+    CircuitBreaker cb{CircuitConfig{}
+                          .with_count_window(10)
+                          .with_minimum_calls(4)
+                          .with_slow_calls(Duration{100}, 0.5),
+                      std::ref(clock)};
+
+    auto slow_success = [&] {
+        cb.execute([&] {
+            clock.advance(Duration{200});
+            return 0;
+        });
+    };
+    succeed(cb);
+    succeed(cb);
+    slow_success();
+    CHECK(cb.state() == CircuitState::Closed);  // 3 calls, below minimum
+    slow_success();                             // 2 of 4 slow = 50%
+    CHECK(cb.state() == CircuitState::Open);
+    CHECK(cb.metrics().failures == 0);
+}
+
+TEST("CircuitBreaker: a slow trial call in HalfOpen re-opens the breaker") {
+    FakeClock clock;
+    CircuitBreaker cb{CircuitConfig{}
+                          .with_count_window(10)
+                          .with_reset_timeout(Duration{1000})
+                          .with_slow_calls(Duration{100}),
+                      std::ref(clock)};
+    cb.force_open();
+    clock.advance(Duration{1000});
+    CHECK(cb.state() == CircuitState::HalfOpen);
+
+    cb.execute([&] {
+        clock.advance(Duration{500});  // "works", but far too slowly
+        return 0;
+    });
+    CHECK(cb.state() == CircuitState::Open);
+}
+
+TEST("CircuitBreaker: metrics and window reset on state changes") {
+    FakeClock clock;
+    CircuitBreaker cb{CircuitConfig{}
+                          .with_count_window(10)
+                          .with_minimum_calls(3)
+                          .with_failure_rate_threshold(0.6)
+                          .with_reset_timeout(Duration{1000}),
+                      std::ref(clock)};
+    succeed(cb);
+    fail(cb);
+    succeed(cb);
+    keel::CircuitMetrics m = cb.metrics();
+    CHECK(m.state == CircuitState::Closed);
+    CHECK(m.calls == 3 && m.failures == 1);
+
+    cb.force_open();
+    clock.advance(Duration{1000});
+    succeed(cb);  // trial succeeds, breaker closes
+    m = cb.metrics();
+    CHECK(m.state == CircuitState::Closed);
+    CHECK(m.calls == 0);  // a fresh window after recovering
+}

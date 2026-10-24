@@ -19,7 +19,7 @@
 #include <string>
 
 #define KEEL_VERSION_MAJOR 1
-#define KEEL_VERSION_MINOR 3
+#define KEEL_VERSION_MINOR 4
 #define KEEL_VERSION_PATCH 0
 
 namespace keel {
@@ -47,6 +47,21 @@ inline double default_random() {
 }
 
 inline TimePoint default_now() { return SteadyClock::now(); }
+
+namespace detail {
+
+// A clock that skips the std::function call when no custom clock was given.
+// Reading time sits on hot paths, so the indirect call is worth avoiding.
+class Clock {
+public:
+    explicit Clock(ClockFn fn = {}) : fn_(std::move(fn)) {}
+    TimePoint now() const { return fn_ ? fn_() : SteadyClock::now(); }
+
+private:
+    ClockFn fn_;
+};
+
+}  // namespace detail
 
 // Base class for every error keel itself throws when it refuses or abandons a
 // call (circuit_open_error, rate_limited_error, timeout_error). Catch this to

@@ -25,8 +25,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Single header is up to date
+        if: matrix.name == 'linux-gcc'
+        run: python3 tools/amalgamate.py --check
+
+      # Benchmarks are only built here, to keep them compiling everywhere;
+      # numbers from shared CI runners would be too noisy to mean anything.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DKEEL_BUILD_BENCHMARKS=ON
         env:
           CXX: ${{ matrix.cxx }}
 

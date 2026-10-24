@@ -60,8 +60,8 @@ class RetryBudget {
 public:
     explicit RetryBudget(RetryBudgetConfig config = {}, ClockFn clock = {})
         : config_(config),
-          now_(clock ? std::move(clock) : ClockFn{&default_now}),
-          origin_(now_()) {
+          clock_(std::move(clock)),
+          origin_(clock_.now()) {
         const Duration::rep width =
             config_.window.count() / static_cast<Duration::rep>(kBuckets);
         bucket_width_ = Duration{std::max<Duration::rep>(width, 1)};
@@ -118,7 +118,7 @@ private:
     };
 
     std::int64_t current_slot() const {
-        const auto elapsed = now_() - origin_;
+        const auto elapsed = clock_.now() - origin_;
         const auto slot = static_cast<std::int64_t>(elapsed / bucket_width_);
         return slot < 0 ? 0 : slot;
     }
@@ -152,7 +152,7 @@ private:
     }
 
     RetryBudgetConfig config_;
-    ClockFn now_;
+    detail::Clock clock_;
     TimePoint origin_;
     Duration bucket_width_{1};
 

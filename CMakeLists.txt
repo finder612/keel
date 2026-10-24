@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(keel
-    VERSION 1.3.0
-    DESCRIPTION "Resilience primitives (retry, retry budgets, circuit breaker, fallback, timeout, rate limiting, single-flight) for C++ backends"
+    VERSION 1.4.0
+    DESCRIPTION "Resilience primitives (retry, retry budgets, circuit breaker, bulkhead, adaptive concurrency limits, fallback, timeout, rate limiting, single-flight) for C++ backends"
     LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
@@ -31,6 +31,7 @@ else()
     option(KEEL_BUILD_TESTS "Build the keel test suite" OFF)
     option(KEEL_BUILD_EXAMPLES "Build the keel examples" OFF)
 endif()
+option(KEEL_BUILD_BENCHMARKS "Build the keel micro-benchmarks" OFF)
 
 if(KEEL_BUILD_TESTS)
     enable_testing()
@@ -39,6 +40,10 @@ endif()
 
 if(KEEL_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(KEEL_BUILD_BENCHMARKS)
+    add_subdirectory(bench)
 endif()
 
 # ---------------------------------------------------------------------------

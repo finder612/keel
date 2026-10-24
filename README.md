@@ -1,11 +1,11 @@
 # keel
 
 A small header-only C++17 library for making backend calls survive bad days:
-retries with backoff, retry budgets, a circuit breaker, fallbacks, timeouts, a
-rate limiter and request coalescing. No dependencies beyond the standard
-library.
+retries with backoff, retry budgets, a circuit breaker, bulkheads, adaptive
+concurrency limits, fallbacks, timeouts, a rate limiter and request
+coalescing. No dependencies beyond the standard library.
 
-Current version: **1.3.0**
+Current version: **1.4.0**
 
 ## Why this exists
 
@@ -40,8 +40,13 @@ A few things we cared about:
 
 ## Getting it into your project
 
-The simplest way: copy [`include/keel/`](include/keel) into your project and
-`#include "keel/keel.hpp"`. That's it.
+The simplest way: grab the single header
+[`single_include/keel/keel.hpp`](single_include/keel/keel.hpp), drop it into
+your project and `#include "keel/keel.hpp"`. One file, nothing else to set up.
+
+If you'd rather have the individual headers (to include only the parts you
+use), copy [`include/keel/`](include/keel) instead. Both are the same code, and
+they even mix safely in one project.
 
 If you use CMake, you can vendor the repo (a git submodule works well) and add
 it as a subdirectory:
@@ -168,7 +173,27 @@ CircuitBreaker cb{CircuitConfig{}
 auto value = cb.execute([&] { return call_service(); });
 ```
 
-It's safe to share one breaker between threads. A few more knobs:
+It's safe to share one breaker between threads.
+
+Counting failures in a row is fine for a dependency that's simply down. Real
+trouble is often messier: a third of the calls fail, or everything gets slow.
+For that, judge a window of recent calls instead:
+
+```cpp
+CircuitBreaker cb{CircuitConfig{}
+                      .with_count_window(100)             // the last 100 calls...
+                      .with_minimum_calls(20)             // ...once there are at least 20
+                      .with_failure_rate_threshold(0.5)   // open at 50% failures
+                      .with_slow_calls(Duration{2000}, 0.8)};  // or 80% slower than 2s
+```
+
+`with_time_window(Duration{60000})` looks at the last minute instead of the
+last N calls. `minimum_calls` keeps a single early failure from opening the
+breaker, and a trial call that succeeds but is too slow counts as a failure,
+because the service isn't really back yet. `metrics()` returns the current
+state, call counts and rates in one snapshot.
+
+A few more knobs:
 
 - `with_failure_if(pred)` decides what counts as a failure. A "user not found"
   isn't an outage, so you probably don't want it to trip the breaker. Errors
@@ -288,6 +313,62 @@ the wait, and `rate_limited_error::retry_after()` carries the same number.
 
 Also thread-safe.
 
+### Bulkhead
+
+One slow dependency can quietly tie up every worker thread you have, and then
+your whole service is down, not just the part that talks to it. A bulkhead
+(named after the watertight compartments in a ship) gives each dependency a
+fixed number of slots:
+
+```cpp
+Bulkhead payments{BulkheadConfig{}
+                      .with_max_concurrent(8)          // 8 calls at once
+                      .with_max_queue(16)              // 16 more may wait...
+                      .with_max_wait(Duration{50})};   // ...for up to 50ms
+
+auto receipt = payments.execute([&] { return gateway.charge(order); });
+```
+
+When every slot is taken and the queue is full, or the wait runs out, you get
+`bulkhead_full_error` right away instead of piling up. For callback-style code,
+`try_acquire()` and `acquire_for(wait)` hand you a permit that holds the slot
+until it's destroyed.
+
+### AdaptiveLimiter
+
+A fixed limit like "8 at once" is a guess, and the right number keeps moving
+with the database's load and the query mix. Too high and a slow dependency
+builds a queue that hurts everyone; too low and you waste capacity.
+
+An adaptive limiter finds the number by itself, the way TCP handles
+congestion. It watches how long calls take and whether they fail from
+overload, raises the limit while things are healthy and lowers it as soon as
+latency climbs. Calls over the current limit get `limit_exceeded_error`
+immediately, which is far cheaper than letting them queue.
+
+```cpp
+AdaptiveLimiter db_limit{GradientLimit{},
+                         AdaptiveLimiterConfig{}
+                             .with_initial_limit(20)
+                             .with_max_limit(200)};
+
+auto rows = db_limit.execute([&] { return db.query("..."); });
+```
+
+Three algorithms come with it:
+
+| Algorithm       | Reacts to          | Good for                                         |
+|-----------------|--------------------|--------------------------------------------------|
+| `AimdLimit`     | failures, timeouts | simple, predictable setups                       |
+| `VegasLimit`    | rising latency     | spotting queueing before anything fails          |
+| `GradientLimit` | latency vs. its own average | backends whose normal latency drifts     |
+
+Not every error means "overloaded". A validation error shouldn't shrink the
+limit, so tell it which ones do with `with_drop_if(pred)`. And if none of the
+algorithms suits you, derive from `LimitAlgorithm` and write your own; it's a
+single `update(limit, sample)` method. The design and the algorithms follow
+Netflix's concurrency-limits library.
+
 ### SingleFlight
 
 A popular cache entry expires, and a thousand requests that all need it go to
@@ -342,9 +423,9 @@ auto user = with_fallback(
 
 ## Telling keel's errors apart from yours
 
-Everything keel throws on its own, `circuit_open_error`, `rate_limited_error`
-and `timeout_error`, derives from `keel::error` (which is a
-`std::runtime_error`). So "keel refused or gave up" can be handled in one
+Everything keel throws on its own, `circuit_open_error`, `rate_limited_error`,
+`bulkhead_full_error`, `limit_exceeded_error` and `timeout_error`, derives from
+`keel::error` (which is a `std::runtime_error`). So "keel refused or gave up" can be handled in one
 place, separately from your actual failures:
 
 ```cpp
@@ -370,7 +451,9 @@ in your own behavior:
 | where time comes from           | `clock(fn)` on the policy, a `ClockFn` for breakers, limiters and budgets |
 | the randomness in jitter        | `random(fn)`                                                |
 | what counts as an outage        | `CircuitConfig::with_failure_if(pred)`                      |
-| logging and metrics             | `on_retry(cb)`, `with_on_state_change(cb)`, `waiters(key)`, `budget.retries()` |
+| when the breaker trips          | consecutive failures, `with_count_window` / `with_time_window`, `with_slow_calls` |
+| how concurrency adapts          | your own `LimitAlgorithm`, `with_drop_if(pred)`             |
+| logging and metrics             | `on_retry(cb)`, `with_on_state_change(cb)`, `cb.metrics()`, `with_on_limit_change(cb)`, `waiters(key)`, `budget.retries()` |
 | where timed work runs           | an `Executor` for `timeout`                                 |
 | how keys are hashed and compared| `SingleFlight<Key, Value, Hash, KeyEqual>`                  |
 | breaker control from outside    | `try_acquire()` permits, `reset()`, `force_open()`          |
@@ -391,6 +474,44 @@ p.max_attempts(3)
 
 The circuit breaker and rate limiter accept a clock you can move forward by
 hand. [`tests/tests.cpp`](tests/tests.cpp) has plenty of examples.
+
+## How much does it cost?
+
+Less than you'd think, but not nothing. These are keel's own overheads per
+call, measured by wrapping a function that does almost no work (Release build,
+MSVC 19.51, AMD Ryzen 7 5700X3D, Windows):
+
+| Component                                     | Single thread | 8 threads, one instance |
+|-----------------------------------------------|--------------:|------------------------:|
+| `retry`, succeeds first time                  | 3 ns          |                         |
+| `with_fallback`, primary succeeds             | 2 ns          |                         |
+| `Bulkhead::execute`                           | 17 ns         | 49 ns                   |
+| `CircuitBreaker::execute` (default)           | 22 ns         | 68 ns                   |
+| `CircuitBreaker::execute` (count window)      | 28 ns         |                         |
+| `CircuitBreaker::execute` (time window, slow-call tracking) | 79 ns |                 |
+| `retry` with a `RetryBudget`                  | 37 ns         | 46 ns                   |
+| `RateLimiter::try_acquire`                    | 37 ns         | 52 ns                   |
+| `SingleFlight::run`, nobody waiting           | 45 ns         |                         |
+| `AdaptiveLimiter::execute` (gradient)         | 82 ns         |                         |
+| `timeout` on your own executor                | ~170 ns       |                         |
+| `timeout` with a new thread per call          | ~53 µs        |                         |
+
+A few things worth knowing:
+
+- Compared with a database query or a network hop, all of this is noise.
+  The exception is `timeout` without an executor: starting a thread is
+  expensive, so on a hot path, give it your thread pool.
+- Components that need the time (rate limiter, retry budget, time windows,
+  slow-call tracking, the adaptive limiter) pay for a clock read, which is a
+  good chunk of their cost on some platforms. The default breaker skips the
+  clock entirely on successful calls.
+- Your numbers will differ. Run them yourself:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DKEEL_BUILD_BENCHMARKS=ON
+cmake --build build --config Release
+./build/bench/keel_bench
+```
 
 ## Building the tests and the example
 

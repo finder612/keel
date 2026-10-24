@@ -91,6 +91,29 @@ struct timeout_result<Fn, std::enable_if_t<std::is_invocable_v<Fn&, CancelToken>
     using type = std::invoke_result_t<Fn&, CancelToken>;
 };
 
+// Starts `task` on the executor and waits up to `limit` for it. The task is
+// kept alive by a shared_ptr, so nothing the background work needs is
+// destroyed if we stop waiting.
+template <class Result, class OnTimeout>
+Result run_with_deadline(Duration limit, const std::shared_ptr<std::packaged_task<Result()>>& task,
+                         const Executor& executor, OnTimeout on_timeout) {
+    std::future<Result> future = task->get_future();
+
+    // Captured by copy rather than moved: the cost is one reference-count bump,
+    // and it keeps static analyzers able to follow who owns the task.
+    std::function<void()> job = [task] { (*task)(); };
+    if (executor)
+        executor(std::move(job));
+    else
+        default_executor(std::move(job));
+
+    if (future.wait_for(limit) != std::future_status::ready) {
+        on_timeout();
+        throw timeout_error(limit);
+    }
+    return future.get();
+}
+
 }  // namespace detail
 
 template <class Fn>
@@ -99,31 +122,18 @@ auto timeout(Duration limit, Fn&& fn, const Executor& executor = {})
     using Work = std::decay_t<Fn>;
     using Result = typename detail::timeout_result<Work>::type;
 
-    CancelToken token;
-
-    // The task owns its own copy of `fn` and is kept alive by a shared_ptr, so
-    // nothing the background thread needs is destroyed if we give up on it.
-    auto task = std::make_shared<std::packaged_task<Result()>>(
-        [work = Work(std::forward<Fn>(fn)), token]() mutable -> Result {
-            if constexpr (std::is_invocable_v<Work&, CancelToken>) {
-                return work(token);
-            } else {
-                return work();
-            }
-        });
-    std::future<Result> future = task->get_future();
-
-    std::function<void()> job = [task] { (*task)(); };
-    if (executor)
-        executor(std::move(job));
-    else
-        default_executor(std::move(job));
-
-    if (future.wait_for(limit) != std::future_status::ready) {
-        token.cancel();
-        throw timeout_error(limit);
+    // The task owns its own copy of `fn`. A CancelToken (one more allocation)
+    // is only created for functions that actually take one.
+    if constexpr (std::is_invocable_v<Work&, CancelToken>) {
+        CancelToken token;
+        auto task = std::make_shared<std::packaged_task<Result()>>(
+            [work = Work(std::forward<Fn>(fn)), token]() mutable -> Result { return work(token); });
+        return detail::run_with_deadline<Result>(limit, task, executor,
+                                                 [&token] { token.cancel(); });
+    } else {
+        auto task = std::make_shared<std::packaged_task<Result()>>(Work(std::forward<Fn>(fn)));
+        return detail::run_with_deadline<Result>(limit, task, executor, [] {});
     }
-    return future.get();
 }
 
 }  // namespace keel

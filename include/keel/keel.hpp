@@ -7,7 +7,9 @@
 #ifndef KEEL_KEEL_HPP
 #define KEEL_KEEL_HPP
 
+#include "keel/adaptive_limiter.hpp"
 #include "keel/backoff.hpp"
+#include "keel/bulkhead.hpp"
 #include "keel/circuit_breaker.hpp"
 #include "keel/common.hpp"
 #include "keel/fallback.hpp"

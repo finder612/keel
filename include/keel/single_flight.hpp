@@ -29,9 +29,11 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace keel {
 
@@ -52,37 +54,32 @@ public:
     Value run(const Key& key, Fn&& fn) {
         std::unique_lock<std::mutex> lock(mutex_);
 
-        // One hash lookup either finds the running call or reserves the slot.
-        auto [it, inserted] = calls_.try_emplace(key);
-        if (!inserted) {
-            ++it->second.waiters;
-            std::shared_future<Value> future = it->second.future;
+        auto it = calls_.find(key);
+        if (it != calls_.end()) {
+            Call& call = it->second;
+            // The shared state is only created once somebody actually joins,
+            // so a call nobody else asked for never pays for it.
+            if (!call.promise) {
+                call.promise.emplace();
+                call.future = call.promise->get_future().share();
+            }
+            ++call.waiters;
+            std::shared_future<Value> future = call.future;
             lock.unlock();
             return future.get();
         }
 
-        // Only the caller that does the work pays for the shared state.
-        std::promise<Value> promise;
         const std::uint64_t id = ++next_id_;
-        try {
-            it->second.id = id;
-            it->second.future = promise.get_future().share();
-        } catch (...) {
-            calls_.erase(it);
-            throw;
-        }
+        start_call(key, id);
         lock.unlock();
 
-        // Remove the entry before publishing the result, so callers arriving
-        // after completion start a fresh call instead of reusing this one.
         try {
             Value value = fn();
-            finish(key, id);
-            promise.set_value(value);
+            publish(key, id, [&](std::promise<Value>& p) { p.set_value(value); });
             return value;
         } catch (...) {
-            finish(key, id);
-            promise.set_exception(std::current_exception());
+            const std::exception_ptr error = std::current_exception();
+            publish(key, id, [&](std::promise<Value>& p) { p.set_exception(error); });
             throw;
         }
     }
@@ -93,7 +90,11 @@ public:
     // for example right after the underlying data was written.
     void forget(const Key& key) {
         std::lock_guard<std::mutex> guard(mutex_);
-        calls_.erase(key);
+        auto it = calls_.find(key);
+        if (it == calls_.end()) return;
+        // Waiters still need the result, so keep their promise alive by id.
+        if (it->second.promise) detached_.emplace(it->second.id, std::move(*it->second.promise));
+        recycle(it);
     }
 
     // Number of keys with a call currently running.
@@ -113,20 +114,71 @@ public:
 private:
     struct Call {
         std::uint64_t id = 0;  // tells apart calls that reused the same key
+        std::optional<std::promise<Value>> promise;  // created when the first waiter joins
         std::shared_future<Value> future;
         std::size_t waiters = 0;
     };
 
-    // Removes the entry only if it still belongs to call `id`; after forget()
-    // the key may already point at a newer call that must be left alone.
-    void finish(const Key& key, std::uint64_t id) {
-        std::lock_guard<std::mutex> guard(mutex_);
-        auto it = calls_.find(key);
-        if (it != calls_.end() && it->second.id == id) calls_.erase(it);
+    using Map = std::unordered_map<Key, Call, Hash, KeyEqual>;
+
+    // Map nodes kept for reuse. With a steady set of hot keys this means no
+    // allocation per call for the map itself.
+    static constexpr std::size_t kMaxSpareNodes = 64;
+
+    // Caller must hold the lock.
+    void start_call(const Key& key, std::uint64_t id) {
+        if constexpr (std::is_copy_assignable_v<Key>) {
+            if (!spare_.empty()) {
+                typename Map::node_type node = std::move(spare_.back());
+                spare_.pop_back();
+                node.key() = key;
+                node.mapped().id = id;
+                calls_.insert(std::move(node));
+                return;
+            }
+        }
+        Call call;
+        call.id = id;
+        calls_.emplace(key, std::move(call));
+    }
+
+    // Caller must hold the lock. Removes the entry, keeping its node if there
+    // is room.
+    void recycle(typename Map::iterator it) {
+        typename Map::node_type node = calls_.extract(it);
+        if (spare_.size() < kMaxSpareNodes) {
+            node.mapped() = Call{};
+            spare_.push_back(std::move(node));
+        }
+    }
+
+    // Hands the outcome to anyone who joined call `id`, then retires it. After
+    // forget() the key may already point at a newer call, which is left alone.
+    template <class Deliver>
+    void publish(const Key& key, std::uint64_t id, Deliver deliver) {
+        std::optional<std::promise<Value>> promise;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            auto it = calls_.find(key);
+            if (it != calls_.end() && it->second.id == id) {
+                promise = std::move(it->second.promise);
+                recycle(it);
+            } else {
+                auto detached = detached_.find(id);
+                if (detached != detached_.end()) {
+                    promise = std::move(detached->second);
+                    detached_.erase(detached);
+                }
+            }
+        }
+        // Delivered outside the lock: waking waiters shouldn't block new calls.
+        if (promise) deliver(*promise);
     }
 
     mutable std::mutex mutex_;
-    std::unordered_map<Key, Call, Hash, KeyEqual> calls_;
+    Map calls_;
+    std::vector<typename Map::node_type> spare_;
+    std::unordered_map<std::uint64_t, std::promise<Value>> detached_;
     std::uint64_t next_id_ = 0;
 };
 
