@@ -1,4 +1,4 @@
-// keel — resilience primitives (retry, backoff, circuit breaker, fallback)
+// keel: resilience primitives (retry, backoff, circuit breaker, fallback)
 // for backend and database calls in modern C++.
 //
 // Copyright (c) 2026 the keel authors.
@@ -17,8 +17,8 @@
 #include <functional>
 #include <random>
 
-#define KEEL_VERSION_MAJOR 0
-#define KEEL_VERSION_MINOR 1
+#define KEEL_VERSION_MAJOR 1
+#define KEEL_VERSION_MINOR 2
 #define KEEL_VERSION_PATCH 0
 
 namespace keel {

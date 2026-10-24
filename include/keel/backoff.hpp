@@ -47,7 +47,7 @@ public:
 
     // Randomize the delay to avoid a thundering herd. `ratio` in [0, 1] is the
     // fraction of the delay that is randomized: 1.0 (the default) is "full
-    // jitter" — a uniform pick in [0, delay]; 0.5 keeps half fixed and jitters
+    // jitter", a uniform pick in [0, delay]; 0.5 keeps half fixed and jitters
     // the rest.
     Backoff& with_jitter(double ratio = 1.0) {
         jitter_ratio_ = std::clamp(ratio, 0.0, 1.0);

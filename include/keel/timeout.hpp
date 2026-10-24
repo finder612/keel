@@ -1,4 +1,4 @@
-// timeout() — give a single operation a time budget.
+// timeout(): give a single operation a time budget.
 //
 //   auto rows = keel::timeout(keel::Duration{500}, [&] { return db.query("..."); });
 //
@@ -7,7 +7,7 @@
 //
 // IMPORTANT: on timeout the operation is NOT cancelled. It keeps running in a
 // detached thread until it finishes on its own. Only use this with work that is
-// safe to abandon — it must not touch caller-local objects that may be
+// safe to abandon: it must not touch caller-local objects that may be
 // destroyed after the timeout, and it should free its own resources when it
 // eventually completes. For work that supports real cancellation, prefer the
 // operation's native deadline (e.g. a socket or query timeout) instead.

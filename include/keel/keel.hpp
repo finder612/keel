@@ -1,4 +1,4 @@
-// keel — umbrella header.
+// keel: umbrella header.
 //
 // Include this to pull in the whole library, or include the individual headers
 // (keel/retry.hpp, keel/circuit_breaker.hpp, ...) for finer control.

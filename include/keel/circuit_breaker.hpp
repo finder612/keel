@@ -1,4 +1,4 @@
-// CircuitBreaker — stop hammering a failing dependency.
+// CircuitBreaker: stop hammering a failing dependency.
 //
 // A breaker has three states:
 //

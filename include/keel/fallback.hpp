@@ -1,4 +1,4 @@
-// with_fallback() — run a primary operation, and if it throws, run a fallback.
+// with_fallback(): run a primary operation, and if it throws, run a fallback.
 //
 //   // Serve from cache when the database is unreachable.
 //   auto user = keel::with_fallback(

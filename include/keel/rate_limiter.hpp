@@ -1,4 +1,4 @@
-// RateLimiter — a thread-safe token-bucket limiter.
+// RateLimiter: a thread-safe token-bucket limiter.
 //
 // Tokens refill continuously at `rate_per_second`, up to a maximum of `burst`
 // tokens. Each call consumes tokens; when the bucket is empty, calls are

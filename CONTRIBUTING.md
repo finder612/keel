@@ -1,10 +1,11 @@
 # Contributing to keel
 
-Thanks for your interest! keel is intentionally small and focused on a few
-well-understood resilience patterns. Fixes, tests, docs, portability work, and
-the items on the roadmap are all welcome.
+Thanks for stopping by! keel is meant to stay small, so the most useful
+contributions are usually bug fixes, better tests, clearer docs and making it
+build in more places. Ideas from the "What's next" list in the README are very
+welcome too.
 
-## Getting started
+## Building and running the tests
 
 From the root of your clone:
 
@@ -14,29 +15,35 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Requires a C++17 compiler (GCC, Clang or MSVC).
+Any C++17 compiler should do. CI checks GCC, Clang and MSVC.
 
-## Guidelines
+## A few house rules
 
-- **Keep it header-only and dependency-free** (standard library + threads
-  only). The whole library is under `include/keel/`; the test harness in
-  `tests/check.hpp` is dependency-free on purpose too.
-- **Keep time injectable.** Anything that sleeps, reads the clock, or uses
-  randomness must accept an override (`SleepFn`, `ClockFn`, `RandomFn`) so it
-  can be tested deterministically. New features follow the same rule.
-- **Add deterministic tests.** Every behavior change needs a case in
-  `tests/tests.cpp` that passes on GCC, Clang and MSVC and does not rely on
-  real wall-clock time.
-- **Match the style.** Run `clang-format` with the repo's `.clang-format`
-  before committing.
-- **Explain the "why".** New components should come with a short description of
-  the failure mode they address.
+Headers only, no dependencies. Everything lives in `include/keel/` and uses
+nothing but the standard library. Even the test harness in `tests/check.hpp` is
+homemade for this reason.
 
-## Reporting bugs
+Don't hard-code time. If your change sleeps, reads the clock or uses randomness,
+let callers swap it out (see `SleepFn`, `ClockFn` and `RandomFn`). That's what
+keeps the test suite fast and predictable.
 
-Open an issue with a minimal reproduction, the compiler and version, and what
-you expected vs. what happened.
+Add a test for whatever you change. Tests go in `tests/tests.cpp`, and they
+shouldn't depend on real wall-clock time unless there's truly no other way
+(timeout is the one exception right now).
+
+Run `clang-format` before you commit. The repo's `.clang-format` has the
+settings.
+
+Tell us what problem you're solving. For a new feature, a couple of sentences
+about the failure it helps with goes a long way.
+
+## Found a bug?
+
+Open an issue. The most helpful reports include a short snippet that shows the
+problem, your compiler and its version, and what you expected to happen versus
+what actually happened.
 
 ## Code of conduct
 
-By participating you agree to abide by the [Code of Conduct](CODE_OF_CONDUCT.md).
+Please be kind. Everyone taking part is expected to follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).

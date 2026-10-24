@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(keel
-    VERSION 0.1.0
+    VERSION 1.2.0
     DESCRIPTION "Resilience primitives (retry, backoff, circuit breaker, fallback, timeout, rate limiting) for C++ backends"
     LANGUAGES CXX)
 

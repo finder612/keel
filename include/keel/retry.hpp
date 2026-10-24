@@ -1,4 +1,4 @@
-// retry() — re-run a fallible operation according to a RetryPolicy.
+// retry(): re-run a fallible operation according to a RetryPolicy.
 //
 //   keel::RetryPolicy policy;
 //   policy.max_attempts(5)
