@@ -1,0 +1,23 @@
+# Build directories
+/build/
+/out/
+/cmake-build-*/
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# Editor / IDE
+.vs/
+.vscode/
+.idea/
+*.user
+compile_commands.json
