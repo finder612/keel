@@ -1,5 +1,4 @@
-// keel: resilience primitives (retry, backoff, circuit breaker, fallback)
-// for backend and database calls in modern C++.
+// keel: resilience primitives for backend and database calls in modern C++.
 //
 // Copyright (c) 2026 the keel authors.
 // SPDX-License-Identifier: MIT
@@ -16,9 +15,11 @@
 #include <cstddef>
 #include <functional>
 #include <random>
+#include <stdexcept>
+#include <string>
 
 #define KEEL_VERSION_MAJOR 1
-#define KEEL_VERSION_MINOR 2
+#define KEEL_VERSION_MINOR 3
 #define KEEL_VERSION_PATCH 0
 
 namespace keel {
@@ -46,6 +47,14 @@ inline double default_random() {
 }
 
 inline TimePoint default_now() { return SteadyClock::now(); }
+
+// Base class for every error keel itself throws when it refuses or abandons a
+// call (circuit_open_error, rate_limited_error, timeout_error). Catch this to
+// handle "keel said no" in one place, separately from your own errors.
+class error : public std::runtime_error {
+public:
+    explicit error(const std::string& what) : std::runtime_error(what) {}
+};
 
 }  // namespace keel
 

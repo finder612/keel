@@ -2,11 +2,13 @@
 //
 //   cmake -B build && cmake --build build
 //   ./build/examples/keel_example
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "keel/keel.hpp"
 
@@ -89,6 +91,25 @@ int main() {
         std::cout << "  request " << i << ": " << (ok ? "allowed" : "throttled")
                   << "\n";
     }
+    std::cout << "\n";
+
+    // 6) single-flight: five threads want the same row at the same time, but
+    //    only one of them actually goes to the "database".
+    std::cout << "single-flight:\n";
+    keel::SingleFlight<std::string, std::string> loads;
+    std::atomic<int> db_calls{0};
+    std::vector<std::thread> callers;
+    for (int i = 0; i < 5; ++i) {
+        callers.emplace_back([&] {
+            loads.run("user:1", [&] {
+                ++db_calls;
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                return std::string{"alice"};
+            });
+        });
+    }
+    for (auto& t : callers) t.join();
+    std::cout << "  5 callers, database queried " << db_calls << " time(s)\n";
 
     return 0;
 }

@@ -13,6 +13,8 @@
 #include "keel/fallback.hpp"
 #include "keel/rate_limiter.hpp"
 #include "keel/retry.hpp"
+#include "keel/retry_budget.hpp"
+#include "keel/single_flight.hpp"
 #include "keel/timeout.hpp"
 
 #endif  // KEEL_KEEL_HPP

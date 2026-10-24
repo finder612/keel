@@ -16,6 +16,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <utility>
 
 #include "keel/common.hpp"
 
@@ -36,6 +38,18 @@ public:
     // A delay that grows geometrically: base, base*factor, base*factor^2, ...
     static Backoff exponential(Duration base, double factor = 2.0) {
         return Backoff(Kind::Exponential, to_ms(base), factor);
+    }
+
+    // Your own schedule: `fn(attempt)` returns the delay after the attempt-th
+    // failure (1-based). cap() and with_jitter() still apply on top, so you
+    // only describe the shape.
+    //
+    //   // Fibonacci-ish: 100, 100, 200, 300, 500, ...
+    //   auto b = Backoff::custom([](std::size_t n) { return Duration{100 * fib(n)}; });
+    static Backoff custom(std::function<Duration(std::size_t attempt)> fn) {
+        Backoff b(Kind::Custom, 0.0, 1.0);
+        b.custom_ = std::move(fn);
+        return b;
     }
 
     // Clamp every computed delay to at most `max_delay`. Strongly recommended
@@ -69,6 +83,9 @@ public:
             case Kind::Exponential:
                 raw = base_ms_ * std::pow(factor_, static_cast<double>(attempt - 1));
                 break;
+            case Kind::Custom:
+                raw = custom_ ? to_ms(custom_(attempt)) : 0.0;
+                break;
         }
 
         // Guard against overflow / non-finite growth before clamping.
@@ -95,7 +112,7 @@ public:
     }
 
 private:
-    enum class Kind { Fixed, Linear, Exponential };
+    enum class Kind : std::uint8_t { Fixed, Linear, Exponential, Custom };
 
     Backoff(Kind kind, double base_ms, double factor)
         : kind_(kind), base_ms_(base_ms), factor_(factor) {}
@@ -111,6 +128,7 @@ private:
     double factor_;
     double cap_ms_ = -1.0;       // < 0 means "no cap"
     double jitter_ratio_ = 0.0;  // 0 means "no jitter"
+    std::function<Duration(std::size_t)> custom_;  // only used by Kind::Custom
 };
 
 }  // namespace keel

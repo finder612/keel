@@ -5,18 +5,38 @@
 // If the operation finishes within the limit, its result is returned (or its
 // exception rethrown). Otherwise timeout_error is thrown.
 //
-// IMPORTANT: on timeout the operation is NOT cancelled. It keeps running in a
-// detached thread until it finishes on its own. Only use this with work that is
-// safe to abandon: it must not touch caller-local objects that may be
-// destroyed after the timeout, and it should free its own resources when it
-// eventually completes. For work that supports real cancellation, prefer the
-// operation's native deadline (e.g. a socket or query timeout) instead.
+// C++ cannot forcibly stop a running function, so on timeout the operation
+// keeps running in the background until it returns on its own. Two things
+// make that manageable:
+//
+//   * Cooperative cancellation. If your function takes a keel::CancelToken, the
+//     token is cancelled the moment the deadline passes, so long-running work
+//     can check it and bail out early:
+//
+//       keel::timeout(keel::Duration{500}, [](keel::CancelToken token) {
+//           for (auto& chunk : chunks) {
+//               if (token.cancelled()) return partial;
+//               process(chunk);
+//           }
+//           return all;
+//       });
+//
+//   * Your own executor. By default every call gets a fresh detached thread.
+//     Pass an Executor to run the work on a thread pool you already have.
+//
+// Whatever runs past the deadline must not touch caller-local objects that may
+// be gone by then. Prefer an operation's native deadline (a socket or query
+// timeout) when it has one.
 #ifndef KEEL_TIMEOUT_HPP
 #define KEEL_TIMEOUT_HPP
 
+#include <atomic>
+#include <functional>
 #include <future>
-#include <stdexcept>
+#include <memory>
+#include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 #include "keel/common.hpp"
@@ -24,23 +44,85 @@
 namespace keel {
 
 // Thrown by timeout() when the operation exceeds its budget.
-class timeout_error : public std::runtime_error {
+class timeout_error : public error {
 public:
-    timeout_error() : std::runtime_error("keel: operation timed out") {}
+    explicit timeout_error(Duration limit = Duration{0})
+        : error("keel: operation timed out after " + std::to_string(limit.count()) + "ms"),
+          limit_(limit) {}
+
+    // The limit that was exceeded.
+    Duration limit() const noexcept { return limit_; }
+
+private:
+    Duration limit_;
+};
+
+// A cancellation flag shared by all of its copies. Cheap to copy.
+class CancelToken {
+public:
+    CancelToken() : flag_(std::make_shared<std::atomic<bool>>(false)) {}
+
+    bool cancelled() const noexcept { return flag_->load(std::memory_order_acquire); }
+    void cancel() noexcept { flag_->store(true, std::memory_order_release); }
+
+private:
+    std::shared_ptr<std::atomic<bool>> flag_;
+};
+
+// Runs a unit of work somewhere else, e.g. by posting it to a thread pool.
+// The work must eventually run exactly once; if it is dropped, the caller just
+// sees a timeout.
+using Executor = std::function<void(std::function<void()>)>;
+
+// The default: a new detached thread per call.
+inline void default_executor(std::function<void()> work) {
+    std::thread(std::move(work)).detach();
+}
+
+namespace detail {
+
+template <class Fn, class = void>
+struct timeout_result {
+    using type = std::invoke_result_t<Fn&>;
 };
 
 template <class Fn>
-auto timeout(Duration limit, Fn&& fn) -> decltype(fn()) {
-    using Result = decltype(fn());
+struct timeout_result<Fn, std::enable_if_t<std::is_invocable_v<Fn&, CancelToken>>> {
+    using type = std::invoke_result_t<Fn&, CancelToken>;
+};
 
-    std::packaged_task<Result()> task(std::forward<Fn>(fn));
-    std::future<Result> future = task.get_future();
+}  // namespace detail
 
-    // Detached, so the std::future destructor does not block waiting for the
-    // task to finish (which would defeat the timeout).
-    std::thread(std::move(task)).detach();
+template <class Fn>
+auto timeout(Duration limit, Fn&& fn, const Executor& executor = {})
+    -> typename detail::timeout_result<std::decay_t<Fn>>::type {
+    using Work = std::decay_t<Fn>;
+    using Result = typename detail::timeout_result<Work>::type;
 
-    if (future.wait_for(limit) != std::future_status::ready) throw timeout_error{};
+    CancelToken token;
+
+    // The task owns its own copy of `fn` and is kept alive by a shared_ptr, so
+    // nothing the background thread needs is destroyed if we give up on it.
+    auto task = std::make_shared<std::packaged_task<Result()>>(
+        [work = Work(std::forward<Fn>(fn)), token]() mutable -> Result {
+            if constexpr (std::is_invocable_v<Work&, CancelToken>) {
+                return work(token);
+            } else {
+                return work();
+            }
+        });
+    std::future<Result> future = task->get_future();
+
+    std::function<void()> job = [task] { (*task)(); };
+    if (executor)
+        executor(std::move(job));
+    else
+        default_executor(std::move(job));
+
+    if (future.wait_for(limit) != std::future_status::ready) {
+        token.cancel();
+        throw timeout_error(limit);
+    }
     return future.get();
 }
 

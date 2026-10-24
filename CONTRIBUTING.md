@@ -15,7 +15,17 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Any C++17 compiler should do. CI checks GCC, Clang and MSVC.
+Any C++17 compiler should do. CI checks GCC, Clang and MSVC, and also runs
+the tests under AddressSanitizer (leaks and UB included) and ThreadSanitizer.
+If you touch anything with threads or locks, running those locally first will
+save you a round trip:
+
+```bash
+cmake -B build-asan -DCMAKE_CXX_COMPILER=clang++ \
+      -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build-asan && ctest --test-dir build-asan --output-on-failure
+```
 
 ## A few house rules
 
