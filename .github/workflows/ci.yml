@@ -23,7 +23,7 @@ jobs:
           - name: windows-msvc
             os: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -55,7 +55,7 @@ jobs:
       UBSAN_OPTIONS: print_stacktrace=1
       TSAN_OPTIONS: halt_on_error=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Recent kernels randomize mmap more than older sanitizer runtimes expect.
       - name: Relax ASLR for sanitizers
